@@ -255,6 +255,7 @@ class ConnectorBehaviourTest(unittest.TestCase):
 
         conn = object.__new__(self.connector)
         names = [f"layer.{i}" for i in range(layers)]
+        conn.dp_rank = 0
         conn.kv_cache_block_size = block_size
         conn.layer_name_to_local_kv_cache_metadata = {name: {} for name in names}
         conn.kv_caches = {
@@ -270,6 +271,7 @@ class ConnectorBehaviourTest(unittest.TestCase):
         conn._state_tensors = {}
         conn._verify_state_before = {}
         conn._write_state_digests = {}
+        conn._write_kv_digests = {}
         conn._write_reports_lock = threading.Lock()
         return conn, names
 
@@ -345,6 +347,37 @@ class ConnectorBehaviourTest(unittest.TestCase):
         # Both maps are popped, or a long run accumulates a digest per request.
         self.assertEqual(conn._verify_rows, {})
         self.assertEqual(conn._verify_before, {})
+
+    def test_rows_that_match_the_producers_are_reported_as_info(self):
+        conn, names = self.make_connector()
+        rows = conn._verify_rows_for([0, 1], is_mla=False)
+        conn._verify_rows["req"] = rows
+        conn._verify_before["req"] = conn._verify_digest(rows)
+        for name in names:
+            conn.kv_caches[name].k_cache[rows] = 7
+        # What the producer digested from its own source rows before pushing.
+        conn._write_kv_digests["req"] = conn._verify_digest(rows)
+
+        with self.assertLogs("atom", "INFO") as logs:
+            conn._verify_landed("req")
+        self.assertIn("all 3 layers changed and match the producer", logs.output[0])
+        self.assertEqual(conn._write_kv_digests, {})
+
+    def test_rows_that_changed_into_the_wrong_bytes_are_reported(self):
+        conn, names = self.make_connector()
+        rows = conn._verify_rows_for([0, 1], is_mla=False)
+        conn._verify_rows["req"] = rows
+        conn._verify_before["req"] = conn._verify_digest(rows)
+        for name in names:
+            conn.kv_caches[name].k_cache[rows] = 7
+        conn._write_kv_digests["req"] = conn._verify_digest(rows)
+        # Every layer changed, but the last one holds bytes the producer never had.
+        conn.kv_caches[names[2]].k_cache[rows] = 9
+
+        with self.assertLogs("atom", "ERROR") as logs:
+            conn._verify_landed("req")
+        self.assertIn("1 of 3 layers differ from the producer's rows", logs.output[0])
+        self.assertIn(names[2], logs.output[0])
 
     def test_digest_survives_a_dtype_without_arithmetic(self):
         conn, names = self.make_connector()
@@ -547,6 +580,7 @@ class WritePathTest(unittest.TestCase):
         conn._built_state_sessions = {}
         conn._verify_state_before = {}
         conn._write_state_digests = {}
+        conn._write_kv_digests = {}
 
         conn.sent = []
         conn.writes = []
@@ -1042,6 +1076,32 @@ class WritePathTest(unittest.TestCase):
             self.msgpack.loads(frames[1])["state_digest"], request["state_digest"]
         )
 
+    def test_under_verify_the_report_carries_the_source_rows_digest(self):
+        conn = self.make(producer=True)
+        conn._verify_kv = True
+        for cache in conn.kv_caches.values():
+            cache.k_cache[4:6] = 3  # source block 2 of an MLA cache, block_size 2
+        sessions = self.block_sessions()
+        conn._get_or_build_sessions = lambda engine_id: (sessions, None)
+        request = self.push_request(dst_block_ids=[5], src_block_ids=[2])
+
+        conn._write_blocks(request, "engine")
+        # Our source rows, in the order they pair with the consumer's.
+        rows = conn._verify_rows_for([2], is_mla=True)
+        self.assertEqual(request["kv_digest"], conn._verify_digest(rows))
+        conn._finish_write(request, ok=True)
+        ((frames, _host, _port),) = conn.sent
+        self.assertEqual(
+            self.msgpack.loads(frames[1])["kv_digest"], request["kv_digest"]
+        )
+
+    def test_a_failed_push_reports_no_digest(self):
+        conn = self.make(producer=True)
+        request = self.push_request(kv_digest={"layer_0": 1})
+        conn._finish_write(request, ok=False)
+        ((frames, _host, _port),) = conn.sent
+        self.assertNotIn("kv_digest", self.msgpack.loads(frames[1]))
+
     def stateful_peer(self, conn, **remote):
         """`conn` holding one KDA layer of state, facing a consumer's `remote`."""
         import types
@@ -1108,8 +1168,8 @@ class WritePathTest(unittest.TestCase):
         return conn
 
     def test_sessions_span_pools_of_different_sizes(self):
-        # Our pool needs two chunks of 4 blocks, the consumer's three blocks
-        # fit in one: what the merged K3 run registered at 0.90 utilization.
+        # Our pool needs two chunks of 4 blocks while the consumer's three
+        # blocks fit in one: P and D size their pools independently.
         conn = self.block_peer([b"L0", b"L1"], [b"R0"], remote_blocks=3)
 
         ((k_sessions, v_sessions),), _meta = conn._get_or_build_sessions("engine")

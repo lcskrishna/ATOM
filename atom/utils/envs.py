@@ -180,6 +180,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     # Rendezvous base port; set per role when prefill/decode share a node.
     "ATOM_DP_BASE_PORT": lambda: int(os.getenv("ATOM_DP_BASE_PORT", "0")),
+    # Floor for the timeout of groups a multi-node DP rank creates without one
+    # (aiter's gloo groups; torch's own default is 30 minutes), in seconds.
+    "ATOM_MULTINODE_PG_TIMEOUT_S": lambda: int(
+        os.getenv("ATOM_MULTINODE_PG_TIMEOUT_S", "7200")
+    ),
     # Token-equivalent cost of one in-flight request for the "least_tokens" DP
     # load-balance strategy. The per-rank load score is
     #   sum(prompt_tokens) + ATOM_DP_LB_REQ_EQUIV * num_in_flight_requests

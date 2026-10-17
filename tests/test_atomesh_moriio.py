@@ -59,13 +59,16 @@ def generate_cells(model: str) -> list[dict]:
         return json.loads(output.read_text())["include"]
 
 
+def cells_by_name(model: str) -> dict[str, dict]:
+    return {cell["name"]: cell for cell in generate_cells(model)}
+
+
 class MoriIOCellTest(unittest.TestCase):
     """The catalog cell must reach the launcher as a MoRI IO gsm8k-only run."""
 
     @classmethod
     def setUpClass(cls):
-        cells = generate_cells("Kimi-K2.5-MXFP4")
-        cls.cell = next(cell for cell in cells if "moriio" in cell["id"])
+        cls.cell = cells_by_name("Kimi-K2.5-MXFP4")["kimi-k25-1p1d-tp8-moriio-gsm8k"]
 
     def test_cell_selects_moriio_for_both_roles(self):
         env = self.cell["env"]
@@ -152,7 +155,7 @@ class KimiK3MoriIOCellTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        (cls.cell,) = generate_cells("Kimi-K3-MXFP4")
+        cls.cell = cells_by_name("Kimi-K3-MXFP4")["kimi-k3-mxfp4-1p1d-tp8-moriio-gsm8k"]
 
     def test_it_runs_over_moriio_with_the_built_in_config(self):
         env = self.cell["env"]
@@ -179,6 +182,123 @@ class KimiK3MoriIOCellTest(unittest.TestCase):
             '--default-chat-template-kwargs {"thinking":false}',
             self.cell["server_args"]["extra_args"],
         )
+
+
+EP_FLAGS = "--enable-dp-attention --enable-expert-parallel"
+# name: (nodes, prefill nodes_per_worker, decode nodes_per_worker, MoRI IO)
+KIMI_K25_DPA_EP_CELLS = {
+    "kimi-k25-agg-dpa8-ep8-gsm8k": (1, None, 1, False),
+    "kimi-k25-agg-dpa16-ep16-gsm8k": (2, None, 2, False),
+    "kimi-k25-1p1d-dpa8-ep8-moriio-gsm8k": (2, 1, 1, True),
+    "kimi-k25-2p2d-dpa16-ep16-moriio-gsm8k": (4, 2, 2, True),
+}
+KIMI_K3_DPA_EP_CELLS = {
+    "kimi-k3-mxfp4-agg-dpa16-ep16-gsm8k": (2, None, 2, False),
+    "kimi-k3-mxfp4-2p2d-dpa16-ep16-moriio-gsm8k": (4, 2, 2, True),
+}
+
+
+class DpaEpCellsTest(unittest.TestCase):
+    """DP attention + MoRI EP cells, from one node up to 2P2D over MoRI IO."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.k25 = cells_by_name("Kimi-K2.5-MXFP4")
+        cls.k3 = cells_by_name("Kimi-K3-MXFP4")
+
+    def each_cell(self):
+        for cells, shapes in (
+            (self.k25, KIMI_K25_DPA_EP_CELLS),
+            (self.k3, KIMI_K3_DPA_EP_CELLS),
+        ):
+            for name, shape in shapes.items():
+                with self.subTest(cell=name):
+                    yield cells[name], shape
+
+    def test_cells_span_the_nodes_their_workers_need(self):
+        for cell, (nodes, prefill_nodes, decode_nodes, _) in self.each_cell():
+            self.assertEqual(cell["num_nodes"], nodes)
+            service = cell["service"]
+            self.assertEqual(service["decode"].get("nodes_per_worker", 1), decode_nodes)
+            if prefill_nodes is not None:
+                self.assertEqual(
+                    service["prefill"].get("nodes_per_worker", 1), prefill_nodes
+                )
+            self.assertIs(cell["disaggregated"], prefill_nodes is not None)
+
+    def test_every_serving_role_runs_dp_attention_with_ep(self):
+        for cell, (_, prefill_nodes, _, _) in self.each_cell():
+            roles = ("prefill", "decode") if prefill_nodes is not None else ("decode",)
+            for role in roles:
+                self.assertEqual(cell["service"][role]["extra_args"], EP_FLAGS)
+                self.assertEqual(cell["service"][role]["tp"], 8)
+
+    def test_mori_env_is_the_same_on_every_role(self):
+        for cell, (_, _, decode_nodes, moriio) in self.each_cell():
+            for role in ("common", "prefill", "decode"):
+                env = cell["env"][role]
+                self.assertEqual(env["MORI_SHMEM_HEAP_SIZE"], "16G")
+                self.assertEqual(env.get("KV_CONNECTOR"), "moriio" if moriio else None)
+                # Cross-node cells pin the host proxy; pd_server_atom.sh
+                # defaults it for the one-node EP cells. They also replicate the
+                # LM head, whose DP-sharded form needs an intra-node all-gather.
+                if decode_nodes > 1:
+                    self.assertEqual(env["MORI_ENABLE_HOST_PROXY"], "1")
+                    self.assertEqual(env["ATOM_DP_LM_HEAD_MODE"], "default")
+                else:
+                    self.assertNotIn("ATOM_DP_LM_HEAD_MODE", env)
+
+    def test_kimi_k25_cells_drop_the_mooncake_json_and_fit_the_mori_heap(self):
+        for name in KIMI_K25_DPA_EP_CELLS:
+            with self.subTest(cell=name):
+                cell = self.k25[name]
+                self.assertEqual(cell["env"]["decode"]["DECODE_KV_TRANSFER_CONFIG"], "")
+                self.assertEqual(cell["server_args"]["max_num_batched_tokens"], 16384)
+
+    def test_evals_match_the_tp8_moriio_cells(self):
+        for cells, shapes, reference in (
+            (self.k25, KIMI_K25_DPA_EP_CELLS, "kimi-k25-1p1d-tp8-moriio-gsm8k"),
+            (self.k3, KIMI_K3_DPA_EP_CELLS, "kimi-k3-mxfp4-1p1d-tp8-moriio-gsm8k"),
+        ):
+            for name in shapes:
+                with self.subTest(cell=name):
+                    cell = cells[name]
+                    self.assertTrue(cell["eval_only"])
+                    self.assertEqual(cell["accuracy"], cells[reference]["accuracy"])
+                    self.assertEqual(cell["accuracy"]["threshold"], 0.90)
+                    self.assertIn(
+                        '--default-chat-template-kwargs {"thinking":false}',
+                        cell["server_args"]["extra_args"],
+                    )
+
+    def test_kimi_k3_cells_keep_the_tp8_cells_server_and_replayssm_off(self):
+        reference = self.k3["kimi-k3-mxfp4-1p1d-tp8-moriio-gsm8k"]["server_args"]
+        ref_quant = json.loads(reference["online_quant_config"])
+        for name in KIMI_K3_DPA_EP_CELLS:
+            with self.subTest(cell=name):
+                server = self.k3[name]["server_args"]
+                quant = json.loads(server["online_quant_config"])
+                # Only the online quant differs: at TP1 the KDA f_b_proj GEMM is
+                # one the FP8 path refuses, so it stays bf16.
+                self.assertEqual(
+                    {k: v for k, v in server.items() if k != "online_quant_config"},
+                    {k: v for k, v in reference.items() if k != "online_quant_config"},
+                )
+                self.assertEqual(
+                    quant["global_quant_config"], ref_quant["global_quant_config"]
+                )
+                self.assertEqual(
+                    set(quant["exclude_layer"]) - set(ref_quant["exclude_layer"]),
+                    {"*self_attn.f_b_proj*"},
+                )
+                self.assertLessEqual(
+                    set(ref_quant["exclude_layer"]), set(quant["exclude_layer"])
+                )
+                self.assertIs(server["enable_prefix_caching"], False)
+                for role in ("common", "prefill", "decode"):
+                    self.assertEqual(
+                        self.k3[name]["env"][role]["ATOM_ENABLE_REPLAYSSM"], "0"
+                    )
 
 
 class KvConnectorTest(unittest.TestCase):

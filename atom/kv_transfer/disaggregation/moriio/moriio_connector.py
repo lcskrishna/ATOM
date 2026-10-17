@@ -211,6 +211,9 @@ class MoRIIOConnector(KVConnectorBase):
         self._verify_rows: dict[ReqId, Any] = {}
         self._verify_state_before: dict[ReqId, tuple[int, dict[str, int]]] = {}
         self._write_state_digests: dict[ReqId, dict[str, int]] = {}
+        # What the producer's source rows digested to, from its WRITE_DONE: a
+        # changed destination can still hold the wrong bytes.
+        self._write_kv_digests: dict[ReqId, dict[str, int]] = {}
         self._logged_layout = False
 
         # Requests rejected before a single transfer was issued. They have no
@@ -911,21 +914,29 @@ class MoRIIOConnector(KVConnectorBase):
         return dict(zip(names, torch.stack(sums).tolist()))
 
     def _verify_landed(self, req_id: ReqId) -> None:
-        """Report layers whose destination never changed across the transfer."""
+        """Report layers that never landed, or landed unlike the producer's rows."""
         rows = self._verify_rows.pop(req_id, None)
         before = self._verify_before.pop(req_id, None)
+        with self._write_reports_lock:
+            source = self._write_kv_digests.pop(req_id, None)
         if rows is None or before is None:
             return
         after = self._verify_digest(rows)
         unchanged = [name for name, value in before.items() if after[name] == value]
+        differ = [
+            name
+            for name, value in after.items()
+            if source is not None and source.get(name) != value
+        ]
         if unchanged:
             # A digest of 0 on both sides means the destination is still the
             # zeroed buffer; a non-zero one that did not move means an earlier
             # request's bytes were there and the transfer left them alone.
             logger.error(
-                "[moriio-verify] req %s: %d of %d layers unchanged after the "
+                "[moriio-verify] dp %d req %s: %d of %d layers unchanged after the "
                 "transfer reported done (first %s, digest %d -> %d, rows=%d) -- "
                 "decode will attend over KV that never arrived",
+                self.dp_rank,
                 req_id,
                 len(unchanged),
                 len(before),
@@ -934,11 +945,27 @@ class MoRIIOConnector(KVConnectorBase):
                 after[unchanged[0]],
                 rows.numel(),
             )
+        elif differ:
+            logger.error(
+                "[moriio-verify] dp %d req %s: %d of %d layers differ from the "
+                "producer's rows (first %s: producer %d, landed %d, rows=%d) -- "
+                "decode will attend over KV the prompt never produced",
+                self.dp_rank,
+                req_id,
+                len(differ),
+                len(after),
+                differ[0],
+                source.get(differ[0], -1),
+                after[differ[0]],
+                rows.numel(),
+            )
         else:
             logger.info(
-                "[moriio-verify] req %s: all %d layers changed",
+                "[moriio-verify] dp %d req %s: all %d layers changed%s",
+                self.dp_rank,
                 req_id,
                 len(before),
+                "" if source is None else " and match the producer",
             )
 
     def _state_digest(self, slot: int) -> dict[str, int]:
@@ -976,15 +1003,18 @@ class MoRIIOConnector(KVConnectorBase):
         after = self._state_digest(slot)
         if source is None:
             logger.error(
-                "[moriio-verify] req %s: the producer sent no state digest", req_id
+                "[moriio-verify] dp %d req %s: the producer sent no state digest",
+                self.dp_rank,
+                req_id,
             )
             return
         differ = [name for name, value in after.items() if source.get(name) != value]
         if differ:
             logger.error(
-                "[moriio-verify] req %s: %d of %d state tensors differ from the "
+                "[moriio-verify] dp %d req %s: %d of %d state tensors differ from the "
                 "producer's slot (first %s: %d before, %d after, producer %d) -- "
                 "decode will resume from state the prompt never produced",
+                self.dp_rank,
                 req_id,
                 len(differ),
                 len(after),
@@ -995,7 +1025,8 @@ class MoRIIOConnector(KVConnectorBase):
             )
         else:
             logger.info(
-                "[moriio-verify] req %s: all %d state tensors match the producer",
+                "[moriio-verify] dp %d req %s: all %d state tensors match the producer",
+                self.dp_rank,
                 req_id,
                 len(after),
             )
@@ -1192,7 +1223,13 @@ class MoRIIOConnector(KVConnectorBase):
         # Before any block write: a request that cannot carry its state must not
         # leave a half-filled destination behind.
         state_writes = self._state_writes(request, engine_id)
-        _is_mla, per_block_bytes = self._kv_layout()
+        is_mla, per_block_bytes = self._kv_layout()
+        if self._verify_kv:
+            # Weighted by position, so it compares with the consumer's digest
+            # of the destination rows paired with these.
+            request["kv_digest"] = self._verify_digest(
+                self._verify_rows_for(src[: len(dst)], is_mla)
+            )
         groups = self._group_offsets(src[: len(dst)], dst, per_block_bytes)
 
         statuses: list[Any] = []
@@ -1410,6 +1447,8 @@ class MoRIIOConnector(KVConnectorBase):
         report = {"decode_req_id": request["decode_req_id"], "ok": ok}
         if ok and "state_digest" in request:
             report["state_digest"] = request["state_digest"]
+        if ok and "kv_digest" in request:
+            report["kv_digest"] = request["kv_digest"]
         try:
             self.moriio_wrapper.send_message(
                 [MoRIIOConstants.WRITE_DONE, msgpack.dumps(report)],
@@ -1506,6 +1545,7 @@ class MoRIIOConnector(KVConnectorBase):
                         report = msgpack.loads(parts[2])
                         req_id, ok = report["decode_req_id"], bool(report["ok"])
                         state_digest = report.get("state_digest")
+                        kv_digest = report.get("kv_digest")
                     except Exception:
                         logger.exception("Dropping undecodable WRITE_DONE")
                         continue
@@ -1513,6 +1553,8 @@ class MoRIIOConnector(KVConnectorBase):
                         self._write_reports[req_id] = ok
                         if state_digest is not None and self._verify_kv:
                             self._write_state_digests[req_id] = state_digest
+                        if kv_digest is not None and self._verify_kv:
+                            self._write_kv_digests[req_id] = kv_digest
 
                 else:
                     logger.error("Unexpected handshake message type: %s", msg)
@@ -1728,6 +1770,7 @@ class MoRIIOConnector(KVConnectorBase):
                 self._verify_state_before.pop(req_id, None)
                 with self._write_reports_lock:
                     self._write_state_digests.pop(req_id, None)
+                    self._write_kv_digests.pop(req_id, None)
         if self.is_producer:
             done_sending = self.done_sending.copy()
             self.done_sending.clear()
